@@ -8,68 +8,72 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from dotenv import load_dotenv
 
-# Импорт базы данных
+# Імпорт бази даних
 from database.core import init_db
-# Импорт Middleware (Прослойка БД)
+# Імпорт Middleware
 from middlewares.db import DbSessionMiddleware
-# Импорт Хендлеров (Логика команд)
+# Імпорт Хендлерів
 from handlers import common, admin_panel, user_flow, list_flow
 
-# Загрузка настроек
+# Завантаження налаштувань
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = os.getenv("ADMIN_IDS", "").split(",")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 async def on_startup(bot: Bot):
-    """Действия при старте бота"""
-    logger.info("🏗 Проверка Базы Данных...")
+    """Дії при старті бота"""
+    logger.info("🏗 Перевірка Бази Даних...")
     await init_db()
-    logger.info("✅ База данных готова.")
+    logger.info("✅ База даних готова.")
 
-    # Уведомление админов
+    # Сповіщення адмінів
     for admin_id in ADMIN_IDS:
         if admin_id:
             try:
                 await bot.send_message(
                     chat_id=admin_id.strip(), 
-                    text="🤖 <b>Бот успешно запущен!</b>\nСистема готова к работе."
+                    text="🤖 <b>Бот успішно запущено!</b>\nСистема готова до роботи."
                 )
             except Exception as e:
-                logger.warning(f"Не удалось отправить старт админу {admin_id}: {e}")
+                logger.warning(f"Не вдалося відправити старт адміну {admin_id}: {e}")
 
 async def main():
-    # 1. Настройка логов
+    # 1. Налаштування логів
     logger.remove()
     logger.add(sys.stderr, level=LOG_LEVEL)
     logger.add("logs/bot.log", rotation="10 MB", level="DEBUG", compression="zip")
 
     if not BOT_TOKEN:
-        logger.error("❌ Ошибка: BOT_TOKEN не найден в .env")
+        logger.error("❌ Помилка: BOT_TOKEN не знайдено в .env")
         return
 
-    # 2. Инициализация
+    # 2. Ініціалізація
     bot = Bot(
         token=BOT_TOKEN, 
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
     )
     dp = Dispatcher()
 
-    # 3. 🔌 ПОДКЛЮЧЕНИЕ MIDDLEWARE (Важно!)
-    # Это автоматически дает доступ к БД в каждом хендлере
+    # 3. 🔌 ПІДКЛЮЧЕННЯ MIDDLEWARE
     dp.update.middleware(DbSessionMiddleware())
 
-    # 4. 🔌 ПОДКЛЮЧЕНИЕ РОУТЕРОВ (Меню)
-    dp.include_router(common.router)
-    dp.include_router(admin_panel.router)
-    dp.include_router(user_flow.router)
-    dp.include_router(list_flow.router)
+    # 4. 🔌 ПІДКЛЮЧЕННЯ РОУТЕРІВ (УВАГА НА ПОРЯДОК!)
+    
+    dp.include_router(common.router)       # /start, /help
+    dp.include_router(admin_panel.router)  # Адмінка
+    
+    # 👇 ВАЖЛИВО: Списки мають бути ПЕРЕД пошуком
+    dp.include_router(list_flow.router)    # Кнопки "Новий список", "Мій список"
+    
+    # 👇 Пошук йде останнім, бо він ловить "все інше"
+    dp.include_router(user_flow.router)    
 
     # 5. Запуск
     dp.startup.register(on_startup)
     
-    logger.info("🚀 Бот запускается...")
+    logger.info("🚀 Бот запускається...")
     await bot.delete_webhook(drop_pending_updates=True)
     
     try:
@@ -83,4 +87,4 @@ if __name__ == "__main__":
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("🛑 Бот остановлен")
+        logger.info("🛑 Бот зупинено")
