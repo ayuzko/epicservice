@@ -1,0 +1,16 @@
+aiogram==3.22.0
+pydantic==2.11.2
+pydantic-settings==2.11.0
+sqlalchemy==2.0.44
+aiosqlite==0.20.0
+asyncpg==0.30.0
+alembic==1.13.3
+pandas==2.3.3
+openpyxl==3.1.5
+numpy==2.3.5
+python-dotenv==1.0.1
+loguru==0.7.2
+redis==5.2.0
+SpeechRecognition==3.10.4
+pydub==0.25.1
+rapidfuzz==3.14.1
