@@ -1,16 +1,48 @@
-aiogram==3.22.0
-pydantic==2.11.2
-pydantic-settings==2.11.0
-sqlalchemy==2.0.44
-aiosqlite==0.20.0
-asyncpg==0.30.0
-alembic==1.13.3
-pandas==2.3.3
-openpyxl==3.1.5
-numpy==2.3.5
-python-dotenv==1.0.1
-loguru==0.7.2
-redis==5.2.0
-SpeechRecognition==3.10.4
-pydub==0.25.1
-rapidfuzz==3.14.1
+# --- Основні залежності бота ---
+
+# Telegram-бот фреймворк
+aiogram>=3.22.0,<4.0.0
+
+# Налаштування / .env
+pydantic>=2.7.0
+pydantic-settings>=2.0.0
+python-dotenv>=1.0.1
+
+# SQLite (локальна БД)
+aiosqlite>=0.20.0
+
+# Кольорові логи в консолі
+rich>=13.7.0
+
+# --- Бази даних (тепер і на майбутнє) ---
+
+# PostgreSQL (на майбутню міграцію на "бойову" БД)
+asyncpg>=0.29.0
+
+# --- Імпорт / експорт Excel та ODS ---
+
+# Робота з табличними даними (імпорт/експорт, фільтрація, агрегації)
+pandas>=2.2.0
+
+# Драйвер для Excel (XLSX) – використовується pandas.to_excel / read_excel
+openpyxl>=3.1.0
+
+# Підтримка LibreOffice ODS через pandas (двигун odf)
+odfpy>=1.4.1
+
+# --- Утиліти ---
+
+# Робота з датами/часом (якщо знадобиться додаткова обробка)
+python-dateutil>=2.9.0
+
+# --- Dev-залежності (опційно, можна розкоментувати) ---
+
+# Форматування коду
+# black>=24.3.0
+# isort>=5.13.0
+
+# Статична типізація
+# mypy>=1.8.0
+
+# Тести
+# pytest>=8.0.0

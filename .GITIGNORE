@@ -1,26 +1,31 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
+*.pyo
+*.pyd
+
+# Venv
+.venv/
 venv/
 env/
 
-# Environment variables (ВАЖНО: пароли не льем в гит)
-.env
-
-# Database
-*.db
-*.sqlite3
-
-# Logs
-*.log
-logs/
-
-# IDE
-.idea/
+# Editors
 .vscode/
+.idea/
 
-# Excel reports
-*.xlsx
-*.xls
-*.csv
+# Env & secrets
+.env
+.env.*
+
+# Databases & data
+*.db
+*.sqlite
+*.sqlite3
+data/*.db
+data/*.sqlite*
+data/imports/
+data/logs/
+
+# OS junk
+.DS_Store
+thumbs.db
