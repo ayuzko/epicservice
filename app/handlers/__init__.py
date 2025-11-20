@@ -5,7 +5,8 @@ from __future__ import annotations
 from aiogram import Dispatcher
 
 # Роутери користувача
-from app.handlers.user import item_card, main_menu
+# Додаємо імпорт carousel
+from app.handlers.user import item_card, main_menu, carousel
 
 # Роутери адміна
 from app.handlers.admin import import_excel, admin_menu
@@ -17,6 +18,8 @@ def register_user_handlers(dp: Dispatcher) -> None:
     """
     dp.include_router(main_menu.router)
     dp.include_router(item_card.router)
+    # Підключаємо роутер каруселі
+    dp.include_router(carousel.router)
 
 
 def register_admin_handlers(dp: Dispatcher) -> None:

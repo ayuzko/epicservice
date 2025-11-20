@@ -151,7 +151,7 @@ def _find_column(columns: Iterable[str], aliases: List[str]) -> Optional[str]:
 def _safe_float(value: Any) -> Optional[float]:
     """
     Акуратне перетворення в float з підтримкою європейського роздільника коми.
-    Напр. '1,54' -> 1.54.
+    Напр. '1 234,56' -> 1234.56.
     """
     if value is None:
         return None
@@ -160,7 +160,9 @@ def _safe_float(value: Any) -> Optional[float]:
     s = str(value).strip()
     if not s:
         return None
-    s = s.replace(" ", "").replace(",", ".")
+    
+    # ВИПРАВЛЕНО: додано .replace("\xa0", "") для видалення нерозривних пробілів
+    s = s.replace(" ", "").replace("\xa0", "").replace(",", ".")
     try:
         return float(s)
     except (ValueError, TypeError):
@@ -204,9 +206,6 @@ def _detect_columns(df: pd.DataFrame) -> Dict[str, Optional[str]]:
     """
     Пробує знайти відповідність логічних полів (dept_code, qty, sum, ...)
     до реальних назв колонок у DataFrame.
-
-    Поки що робимо це автоматично за COLUMN_ALIASES.
-    У майбутньому сюди "прикрутиться" профіль імпорту з БД (import_profiles).
     """
     cols_map: Dict[str, Optional[str]] = {}
 
@@ -279,7 +278,7 @@ def _row_to_item_dict(row: pd.Series, cols: Dict[str, Optional[str]]) -> Optiona
         "dept_name": str(dept_name).strip() if dept_name is not None else None,
         "group_name": str(group_name).strip() if group_name is not None else None,
         "name": name or "",
-        "unit": "шт",  # поки що дефолт, можна буде брати з окремої колонки
+        "unit": "шт",
         "mt_months": mt_months,
         "qty": qty,
         "sum": total_sum,
@@ -292,10 +291,6 @@ def _row_to_item_dict(row: pd.Series, cols: Dict[str, Optional[str]]) -> Optiona
 def _read_table(path: Path) -> pd.DataFrame:
     """
     Зчитує Excel/ODS у DataFrame за допомогою pandas.read_excel.
-
-    Для .xlsx → engine='openpyxl'
-    Для .ods  → engine='odf'
-    Інакше pandas сам обирає engine.
     """
     engine = _detect_engine(path)
     read_kwargs: Dict[str, Any] = {
@@ -328,21 +323,6 @@ async def import_items_from_file(
     - конвертує рядки в список dict'ів;
     - передає їх у items_repo.upsert_from_import;
     - повертає короткий результат.
-
-    Формат, який очікує items_repo.upsert_from_import:
-    {
-        "sku": str,
-        "dept_code": str,
-        "dept_name": Optional[str],
-        "group_name": Optional[str],
-        "name": str,
-        "unit": str,
-        "mt_months": Optional[float],
-        "qty": float,
-        "sum": float,
-        "reserve": float,
-        "price": Optional[float],
-    }
     """
     file_path = file_path.expanduser().resolve()
     if not file_path.exists():

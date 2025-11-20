@@ -383,19 +383,19 @@ async def handle_add_item_to_active_list(
         )
         return
 
-    # Витягуємо id, sku, name з запису
+    # Витягуємо id для прив'язки
     if isinstance(item, dict):
         item_id = int(item["id"])
-        item_sku = str(item.get("sku") or sku)
-        item_name = str(item.get("name") or "")
     else:
+        # На випадок, якщо репозиторій почне повертати об'єкти
         item_id = int(getattr(item, "id"))
-        item_sku = str(getattr(item, "sku", sku))
-        item_name = str(getattr(item, "name", ""))
+        # Якщо це об'єкт, спробуємо перетворити його на dict для сервісу
+        if hasattr(item, "__dict__"):
+            item = item.__dict__
 
-    # Додаємо рядок у list_items (list_id, item_id, sku, [sku_snapshot], [name_snapshot])
+    # Додаємо рядок у list_items, передаючи ВЕСЬ об'єкт item для зняття snapshot
     try:
-        await add_item_to_list(settings, active_list["id"], item_id, item_sku, item_name)
+        await add_item_to_list(settings, active_list["id"], item_id, item)
     except Exception:
         log.exception("Не вдалося додати товар у list_items")
         await message.answer(

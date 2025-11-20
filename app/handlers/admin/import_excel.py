@@ -37,17 +37,22 @@ async def _save_document_to_disk(document: Document, bot: Bot) -> Path:
     """
     Завантажує документ з Telegram у локальний файл у data/imports/.
 
-    Aiogram 3: у Document немає .download, треба використовувати bot.download(...).
-    Ім'я файлу: <file_unique_id>__<original_filename>
+    Використовує bot.download(...).
+    Ім'я файлу формується безпечно: <file_unique_id>__<safe_filename>
     """
     imports_dir = _ensure_import_dir()
 
     original_name = document.file_name or "import.xlsx"
-    safe_name = original_name.replace("/", "_").replace("\\", "_")
-    target = imports_dir / f"{document.file_unique_id}__{safe_name}"
+    # Використовуємо Path(name).name для захисту від Path Traversal
+    safe_filename = Path(original_name).name
+    
+    # Формуємо цільовий шлях
+    target = imports_dir / f"{document.file_unique_id}__{safe_filename}"
 
     log.info("Збереження файлу імпорту", extra={"file": str(target)})
-    await bot.download(document, destination=str(target))
+    
+    # Aiogram 3: завантаження через метод бота
+    await bot.download(document, destination=target)
 
     return target
 
@@ -55,7 +60,6 @@ async def _save_document_to_disk(document: Document, bot: Bot) -> Path:
 def _parse_admin_ids(settings: Settings) -> set[int]:
     """
     Розбирає TELEGRAM_ADMIN_IDS із Settings (рядок) у множину int ID.
-    Формат у .env: TELEGRAM_ADMIN_IDS=1962821395,123456789
     """
     raw = settings.TELEGRAM_ADMIN_IDS or ""
     ids: set[int] = set()
@@ -73,9 +77,6 @@ def _parse_admin_ids(settings: Settings) -> set[int]:
 def _is_admin(message: Message, settings: Settings) -> bool:
     """
     Перевірка, чи є користувач адміном.
-
-    Використовує TELEGRAM_ADMIN_IDS як рядок із .env,
-    який парсимо у список чисел.
     """
     if not message.from_user:
         return False
@@ -95,8 +96,6 @@ async def cmd_import_help(
 ) -> None:
     """
     /import — коротка інструкція.
-
-    Просто пояснює, що потрібно надіслати Excel/ODS-файл.
     """
     if not _is_admin(message, settings):
         await message.answer("Ця команда доступна лише адміністраторам.")
@@ -119,15 +118,8 @@ async def handle_import_document(
 ) -> None:
     """
     Обробляє документ (Excel/ODS), надісланий адміном.
-
-    Алгоритм:
-    - перевіряємо, що відправник — адмін;
-    - зберігаємо файл у data/imports/;
-    - запускаємо import_items_from_file(..., repos.items);
-    - показуємо короткий звіт.
     """
     if not _is_admin(message, settings):
-        # Ігноруємо документи не-адмінів (щоб не заважати звичайним користувачам).
         return
 
     if not message.document:

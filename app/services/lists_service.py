@@ -86,61 +86,6 @@ async def load_departments(settings: Settings) -> List[Dict[str, Any]]:
 
 
 # -------------------------
-# Структура таблиць списків
-# -------------------------
-
-
-async def ensure_lists_tables(settings: Settings) -> None:
-    """
-    Гарантує існування таблиць user_lists та list_items
-    і, за потреби, додає відсутню колонку sku в list_items.
-    """
-    db_path = _get_sqlite_path(settings)
-
-    create_lists_sql = """
-    CREATE TABLE IF NOT EXISTS user_lists (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id     INTEGER NOT NULL,
-        dept_code   TEXT    NOT NULL,
-        mode        TEXT    NOT NULL,
-        status      TEXT    NOT NULL DEFAULT 'draft',
-        created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
-        updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
-    );
-    """
-
-    # Базова нова схема list_items: list_id + item_id + sku
-    create_items_sql = """
-    CREATE TABLE IF NOT EXISTS list_items (
-        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        list_id         INTEGER NOT NULL,
-        item_id         INTEGER NOT NULL,
-        sku             TEXT    NOT NULL,
-        created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
-        FOREIGN KEY (list_id) REFERENCES user_lists(id) ON DELETE CASCADE,
-        FOREIGN KEY (item_id) REFERENCES items(id)      ON DELETE CASCADE
-    );
-    """
-
-    async with aiosqlite.connect(str(db_path)) as conn:
-        await conn.execute(create_lists_sql)
-        await conn.execute(create_items_sql)
-
-        # Перевіряємо колонки list_items (на випадок старої схеми)
-        conn.row_factory = aiosqlite.Row
-        cur = await conn.execute("PRAGMA table_info(list_items);")
-        rows = await cur.fetchall()
-        col_names = {str(row["name"]) for row in rows}
-
-        # Якщо sku нема – додаємо її
-        if "sku" not in col_names:
-            log.info("Додаємо колонку sku у list_items через ALTER TABLE")
-            await conn.execute("ALTER TABLE list_items ADD COLUMN sku TEXT NOT NULL DEFAULT '';")
-
-        await conn.commit()
-
-
-# -------------------------
 # Операції з user_lists
 # -------------------------
 
@@ -154,7 +99,6 @@ async def create_user_list(
     """
     Створює запис списку в user_lists.
     """
-    await ensure_lists_tables(settings)
     db_path = _get_sqlite_path(settings)
 
     insert_sql = """
@@ -182,7 +126,6 @@ async def load_user_lists_for_user(
     """
     Повертає останні N списків користувача.
     """
-    await ensure_lists_tables(settings)
     db_path = _get_sqlite_path(settings)
 
     query = """
@@ -228,7 +171,6 @@ async def set_active_list(
     """
     Робить вибраний список 'active', інші списки користувача — 'draft'.
     """
-    await ensure_lists_tables(settings)
     db_path = _get_sqlite_path(settings)
 
     async with aiosqlite.connect(str(db_path)) as conn:
@@ -274,7 +216,6 @@ async def get_active_list_for_user(
     """
     Повертає активний список користувача (status='active') або None.
     """
-    await ensure_lists_tables(settings)
     db_path = _get_sqlite_path(settings)
 
     query = """
@@ -314,44 +255,43 @@ async def add_item_to_list(
     settings: Settings,
     list_id: int,
     item_id: int,
-    sku: str,
-    name: str,
+    item_data: Dict[str, Any],
 ) -> None:
     """
-    Додає товар у list_items, заповнюючи item_id і sku.
-
-    Якщо в існуючій БД є старі NOT NULL‑колонки типу
-    sku_snapshot / name_snapshot, також заповнюємо їх.
+    Додає товар у list_items, фіксуючи snapshot даних (ціна, відділ, назва, МТ).
     """
-    await ensure_lists_tables(settings)
     db_path = _get_sqlite_path(settings)
 
     async with aiosqlite.connect(str(db_path)) as conn:
-        conn.row_factory = aiosqlite.Row
+        # Вставляємо повний набір полів відповідно до schema.sql
+        insert_sql = """
+        INSERT INTO list_items (
+            list_id, item_id, sku,
+            sku_snapshot, name_snapshot, dept_snapshot,
+            price_snapshot, mt_months_snapshot,
+            qty, status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'new');
+        """
 
-        # Дізнаємось, які саме колонки є в list_items
-        cur = await conn.execute("PRAGMA table_info(list_items);")
-        rows = await cur.fetchall()
-        col_names = {str(row["name"]) for row in rows}
+        # Витягуємо дані з безпечними дефолтами
+        sku = str(item_data.get("sku", ""))
+        name = str(item_data.get("name", ""))
+        dept = str(item_data.get("dept_code", ""))
+        price = item_data.get("price")
+        mt_months = item_data.get("mt_months")
 
-        # Конструюємо INSERT динамічно
-        columns = ["list_id", "item_id", "sku"]
-        values = [list_id, item_id, sku]
-
-        if "sku_snapshot" in col_names:
-            columns.append("sku_snapshot")
-            values.append(sku)
-
-        if "name_snapshot" in col_names:
-            columns.append("name_snapshot")
-            values.append(name or "")
-
-        cols_sql = ", ".join(columns)
-        placeholders = ", ".join("?" for _ in columns)
-
-        insert_sql = f"INSERT INTO list_items ({cols_sql}) VALUES ({placeholders});"
-
-        await conn.execute(insert_sql, values)
+        await conn.execute(insert_sql, (
+            list_id,
+            item_id,
+            sku,
+            sku,          # sku_snapshot
+            name,         # name_snapshot
+            dept,         # dept_snapshot
+            price,        # price_snapshot
+            mt_months     # mt_months_snapshot
+        ))
+        
         await conn.execute(
             "UPDATE user_lists SET updated_at = datetime('now') WHERE id = ?",
             (list_id,),
