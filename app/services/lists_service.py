@@ -2,33 +2,19 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-import aiosqlite
+from sqlalchemy import select, update, func, desc, and_
+from sqlalchemy.orm import selectinload
 
 from app.config.settings import Settings
 from app.config.departments_map import get_department_name
+from app.db.session import AsyncSessionLocal
+from app.db.models import UserList, ListItem, Item
 from app.utils.logging_setup import get_logger
 
 
 log = get_logger(__name__, action="lists_service")
-
-
-# -------------------------
-# Базові утиліти
-# -------------------------
-
-
-def _get_sqlite_path(settings: Settings) -> Path:
-    """
-    Дістає шлях до файлу SQLite з DB_URL виду 'sqlite:///data/bot.db'.
-    """
-    url = settings.DB_URL
-    if not url.startswith("sqlite:///"):
-        raise RuntimeError("Наразі підтримується лише SQLite з DB_URL=sqlite:///...")
-    path_str = url.replace("sqlite:///", "", 1)
-    return Path(path_str).expanduser().resolve()
 
 
 # -------------------------
@@ -39,33 +25,23 @@ def _get_sqlite_path(settings: Settings) -> Path:
 async def load_departments(settings: Settings) -> List[Dict[str, Any]]:
     """
     Читає з БД унікальні відділи з таблиці items.
-
-    Якщо dept_name порожнє – підставляємо назву з departments.json.
     """
-    db_path = _get_sqlite_path(settings)
-    log.info("Завантажуємо відділи з SQLite", extra={"db_path": str(db_path)})
-
-    query = """
-    SELECT
-        dept_code,
-        COALESCE(dept_name, '') AS dept_name,
-        COUNT(*) AS items_count
-    FROM items
-    WHERE dept_code IS NOT NULL AND TRIM(dept_code) <> ''
-    GROUP BY dept_code, dept_name
-    ORDER BY dept_code
-    """
+    async with AsyncSessionLocal() as session:
+        # Групуємо по dept_code, рахуємо кількість
+        stmt = (
+            select(Item.dept_code, Item.dept_name, func.count(Item.id).label("count"))
+            .where(Item.dept_code.is_not(None), Item.dept_code != "")
+            .group_by(Item.dept_code, Item.dept_name)
+            .order_by(Item.dept_code)
+        )
+        result = await session.execute(stmt)
+        rows = result.all()
 
     departments: List[Dict[str, Any]] = []
-
-    async with aiosqlite.connect(str(db_path)) as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute(query) as cur:
-            rows = await cur.fetchall()
-
     for row in rows:
-        code = str(row["dept_code"])
-        db_name = str(row["dept_name"] or "").strip()
+        code = str(row.dept_code)
+        # Беремо ім'я з БД, якщо немає - з файлу конфігу
+        db_name = str(row.dept_name or "").strip()
         mapped_name = get_department_name(code)
         final_name = db_name or mapped_name or ""
 
@@ -73,15 +49,9 @@ async def load_departments(settings: Settings) -> List[Dict[str, Any]]:
             {
                 "dept_code": code,
                 "dept_name": final_name,
-                "items_count": int(row["items_count"]),
+                "items_count": int(row.count),
             }
         )
-
-    log.info(
-        "Знайдено відділів: %s",
-        len(departments),
-        extra={"departments": [f'{d["dept_code"]}={d["dept_name"]}' for d in departments]},
-    )
     return departments
 
 
@@ -99,23 +69,24 @@ async def create_user_list(
     """
     Створює запис списку в user_lists.
     """
-    db_path = _get_sqlite_path(settings)
-
-    insert_sql = """
-    INSERT INTO user_lists (user_id, dept_code, mode, status)
-    VALUES (?, ?, ?, 'draft');
-    """
-
-    async with aiosqlite.connect(str(db_path)) as conn:
-        cur = await conn.execute(insert_sql, (user_id, dept_code, mode))
-        await conn.commit()
-        list_id = cur.lastrowid or 0
+    async with AsyncSessionLocal() as session:
+        new_list = UserList(
+            user_id=user_id,
+            dept_code=dept_code,
+            mode=mode,
+            status="draft"
+        )
+        session.add(new_list)
+        await session.commit()
+        # Refresh щоб отримати ID
+        await session.refresh(new_list)
+        list_id = new_list.id
 
     log.info(
         "Створено новий список",
-        extra={"list_id": list_id, "user_id": user_id, "dept_code": dept_code, "mode": mode},
+        extra={"list_id": list_id, "user_id": user_id, "dept_code": dept_code},
     )
-    return int(list_id)
+    return list_id
 
 
 async def load_user_lists_for_user(
@@ -126,41 +97,29 @@ async def load_user_lists_for_user(
     """
     Повертає останні N списків користувача.
     """
-    db_path = _get_sqlite_path(settings)
-
-    query = """
-    SELECT id, dept_code, mode, status, created_at
-    FROM user_lists
-    WHERE user_id = ?
-    ORDER BY datetime(created_at) DESC, id DESC
-    LIMIT ?
-    """
-
-    async with aiosqlite.connect(str(db_path)) as conn:
-        conn.row_factory = aiosqlite.Row
-        async with conn.execute(query, (user_id, limit)) as cur:
-            rows = await cur.fetchall()
-
-    lists: List[Dict[str, Any]] = []
-    for row in rows:
-        code = str(row["dept_code"])
-        dept_name = get_department_name(code)
-        lists.append(
-            {
-                "id": int(row["id"]),
-                "dept_code": code,
-                "dept_name": dept_name or "",
-                "mode": str(row["mode"]),
-                "status": str(row["status"]),
-                "created_at": str(row["created_at"]),
-            }
+    async with AsyncSessionLocal() as session:
+        stmt = (
+            select(UserList)
+            .where(UserList.user_id == user_id)
+            .order_by(desc(UserList.created_at), desc(UserList.id))
+            .limit(limit)
         )
+        result = await session.execute(stmt)
+        lists_orm = result.scalars().all()
 
-    log.info(
-        "Завантажено списків користувача",
-        extra={"user_id": user_id, "count": len(lists)},
-    )
-    return lists
+    data = []
+    for lst in lists_orm:
+        code = str(lst.dept_code)
+        dept_name = get_department_name(code)
+        data.append({
+            "id": lst.id,
+            "dept_code": code,
+            "dept_name": dept_name or "",
+            "mode": lst.mode,
+            "status": lst.status,
+            "created_at": str(lst.created_at),
+        })
+    return data
 
 
 async def set_active_list(
@@ -171,41 +130,38 @@ async def set_active_list(
     """
     Робить вибраний список 'active', інші списки користувача — 'draft'.
     """
-    db_path = _get_sqlite_path(settings)
+    async with AsyncSessionLocal() as session:
+        # Перевірка власника
+        stmt_get = select(UserList).where(UserList.id == list_id)
+        result = await session.execute(stmt_get)
+        target_list = result.scalar_one_or_none()
 
-    async with aiosqlite.connect(str(db_path)) as conn:
-        conn.row_factory = aiosqlite.Row
-
-        cur = await conn.execute(
-            "SELECT id, user_id, dept_code, mode, status, created_at "
-            "FROM user_lists WHERE id = ?",
-            (list_id,),
-        )
-        row = await cur.fetchone()
-        if row is None or int(row["user_id"]) != user_id:
+        if not target_list or target_list.user_id != user_id:
             return None
 
-        await conn.execute(
-            "UPDATE user_lists SET status = 'draft' WHERE user_id = ?",
-            (user_id,),
+        # Скидаємо всі активні в draft
+        await session.execute(
+            update(UserList)
+            .where(UserList.user_id == user_id, UserList.status == "active")
+            .values(status="draft")
         )
-        await conn.execute(
-            "UPDATE user_lists SET status = 'active', updated_at = datetime('now') WHERE id = ?",
-            (list_id,),
-        )
-        await conn.commit()
 
-        code = str(row["dept_code"])
-        dept_name = get_department_name(code)
+        # Ставимо active поточному
+        target_list.status = "active"
+        target_list.updated_at = func.now()
+        
+        await session.commit()
+        await session.refresh(target_list)
 
+        dept_name = get_department_name(target_list.dept_code)
         return {
-            "id": int(row["id"]),
-            "user_id": int(row["user_id"]),
-            "dept_code": code,
+            "id": target_list.id,
+            "user_id": target_list.user_id,
+            "dept_code": target_list.dept_code,
             "dept_name": dept_name or "",
-            "mode": str(row["mode"]),
-            "status": "active",
-            "created_at": str(row["created_at"]),
+            "mode": target_list.mode,
+            "status": target_list.status,
+            "created_at": str(target_list.created_at),
         }
 
 
@@ -214,35 +170,29 @@ async def get_active_list_for_user(
     user_id: int,
 ) -> Optional[Dict[str, Any]]:
     """
-    Повертає активний список користувача (status='active') або None.
+    Повертає активний список користувача.
     """
-    db_path = _get_sqlite_path(settings)
+    async with AsyncSessionLocal() as session:
+        stmt = (
+            select(UserList)
+            .where(UserList.user_id == user_id, UserList.status == "active")
+            .order_by(desc(UserList.updated_at))
+            .limit(1)
+        )
+        result = await session.execute(stmt)
+        lst = result.scalar_one_or_none()
 
-    query = """
-    SELECT id, dept_code, mode, status, created_at
-    FROM user_lists
-    WHERE user_id = ? AND status = 'active'
-    ORDER BY datetime(updated_at) DESC, id DESC
-    LIMIT 1
-    """
-
-    async with aiosqlite.connect(str(db_path)) as conn:
-        conn.row_factory = aiosqlite.Row
-        cur = await conn.execute(query, (user_id,))
-        row = await cur.fetchone()
-
-    if row is None:
+    if not lst:
         return None
 
-    code = str(row["dept_code"])
-    dept_name = get_department_name(code)
+    dept_name = get_department_name(lst.dept_code)
     return {
-        "id": int(row["id"]),
-        "dept_code": code,
+        "id": lst.id,
+        "dept_code": lst.dept_code,
         "dept_name": dept_name or "",
-        "mode": str(row["mode"]),
-        "status": str(row["status"]),
-        "created_at": str(row["created_at"]),
+        "mode": lst.mode,
+        "status": lst.status,
+        "created_at": str(lst.created_at),
     }
 
 
@@ -258,42 +208,124 @@ async def add_item_to_list(
     item_data: Dict[str, Any],
 ) -> None:
     """
-    Додає товар у list_items, фіксуючи snapshot даних (ціна, відділ, назва, МТ).
+    Додає товар у list_items, фіксуючи snapshot даних.
     """
-    db_path = _get_sqlite_path(settings)
-
-    async with aiosqlite.connect(str(db_path)) as conn:
-        # Вставляємо повний набір полів відповідно до schema.sql
-        insert_sql = """
-        INSERT INTO list_items (
-            list_id, item_id, sku,
-            sku_snapshot, name_snapshot, dept_snapshot,
-            price_snapshot, mt_months_snapshot,
-            qty, status
+    async with AsyncSessionLocal() as session:
+        # Перевіряємо, чи вже є цей товар у списку
+        stmt_check = select(ListItem).where(
+            ListItem.list_id == list_id,
+            ListItem.item_id == item_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'new');
-        """
+        existing = (await session.execute(stmt_check)).scalar_one_or_none()
+        if existing:
+            # Якщо вже є, нічого не робимо (або можна оновити updated_at)
+            return
 
-        # Витягуємо дані з безпечними дефолтами
-        sku = str(item_data.get("sku", ""))
-        name = str(item_data.get("name", ""))
-        dept = str(item_data.get("dept_code", ""))
-        price = item_data.get("price")
-        mt_months = item_data.get("mt_months")
+        # Створюємо новий запис
+        new_item = ListItem(
+            list_id=list_id,
+            item_id=item_id,
+            
+            # Снепшоти
+            sku_snapshot=str(item_data.get("sku", "")),
+            name_snapshot=str(item_data.get("name", "")),
+            dept_snapshot=str(item_data.get("dept_code", "")),
+            price_snapshot=item_data.get("price"),
+            mt_months_snapshot=item_data.get("mt_months"),
+            
+            qty=0.0,
+            surplus_qty=0.0,
+            status="new"
+        )
+        session.add(new_item)
 
-        await conn.execute(insert_sql, (
-            list_id,
-            item_id,
-            sku,
-            sku,          # sku_snapshot
-            name,         # name_snapshot
-            dept,         # dept_snapshot
-            price,        # price_snapshot
-            mt_months     # mt_months_snapshot
-        ))
+        # Оновлюємо час редагування списку
+        await session.execute(
+            update(UserList)
+            .where(UserList.id == list_id)
+            .values(updated_at=func.now())
+        )
         
-        await conn.execute(
-            "UPDATE user_lists SET updated_at = datetime('now') WHERE id = ?",
-            (list_id,),
+        await session.commit()
+
+
+async def update_item_qty(
+    settings: Settings,
+    list_id: int,
+    item_id: int,
+    delta: float = 0,
+    set_exact: Optional[float] = None,
+    is_surplus: bool = False
+) -> Dict[str, Any]:
+    """
+    Змінює кількість товару у списку.
+    """
+    async with AsyncSessionLocal() as session:
+        # Отримуємо ListItem разом з даними про Item (для перевірки залишків)
+        stmt = (
+            select(ListItem, Item)
+            .join(Item, ListItem.item_id == Item.id)
+            .where(ListItem.list_id == list_id, ListItem.item_id == item_id)
         )
-        await conn.commit()
+        result = await session.execute(stmt)
+        row = result.first()
+        
+        if not row:
+            return {"status": "error", "msg": "Товар не у списку"}
+
+        list_item, item_obj = row
+
+        # Доступно для збору (фізично в базі)
+        available = max(0.0, (item_obj.base_qty or 0.0) - (item_obj.base_reserve or 0.0))
+
+        current_collected = list_item.qty or 0.0
+        current_surplus = list_item.surplus_qty or 0.0
+        
+        new_collected = current_collected
+        new_surplus = current_surplus
+
+        if is_surplus:
+            # Робота з надлишком
+            if set_exact is not None:
+                new_surplus = float(set_exact)
+            else:
+                new_surplus += delta
+            if new_surplus < 0: 
+                new_surplus = 0.0
+        else:
+            # Робота з основним збором
+            if set_exact is not None:
+                target = float(set_exact)
+            else:
+                target = current_collected + delta
+            
+            # Обмежуємо основним залишком
+            if target > available:
+                new_collected = available
+                # Можна було б автоматично кидати в надлишок, але поки просто ліміт
+            elif target < 0:
+                new_collected = 0.0
+            else:
+                new_collected = target
+
+        # Зберігаємо
+        list_item.qty = new_collected
+        list_item.surplus_qty = new_surplus
+        list_item.updated_at = datetime.now() # Або func.now() в update
+
+        # Також оновимо UserList.updated_at
+        await session.execute(
+            update(UserList)
+            .where(UserList.id == list_id)
+            .values(updated_at=func.now())
+        )
+
+        await session.commit()
+
+        return {
+            "status": "ok",
+            "collected": new_collected,
+            "surplus": new_surplus,
+            "available": available,
+            "base_reserve": item_obj.base_reserve
+        }

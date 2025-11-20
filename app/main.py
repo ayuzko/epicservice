@@ -1,6 +1,7 @@
 # app/main.py
 
 import asyncio
+import sys
 from typing import Set
 
 from aiogram import Bot, Dispatcher
@@ -11,11 +12,14 @@ from aiogram.types import Message
 
 from app.config.settings import Settings
 from app.db.migrations import run_migrations
-from app.db.sqlite import create_sqlite_repositories, SqliteDatabase, Repositories
+from app.db.session import AsyncSessionLocal
 from app.handlers import register_all_handlers
 from app.keyboards.main_menu import main_menu_kb
 from app.utils.logging_setup import setup_logging, get_logger
 
+# Для коректної роботи на Windows (фікс RuntimeError: Event loop is closed)
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 log = get_logger(__name__, action="startup")
 
@@ -37,11 +41,9 @@ def _parse_admin_ids(settings: Settings) -> Set[int]:
     return ids
 
 
-async def on_startup(bot: Bot, settings: Settings, db: SqliteDatabase, repos: Repositories) -> None:
+async def on_startup(bot: Bot) -> None:
     """
     Викликається при старті Dispatcher.
-
-    Тут БД і репозиторії вже ініціалізовані та передані як залежності.
     """
     log.info("on_startup: бот успішно запущено")
     me = await bot.get_me()
@@ -49,15 +51,11 @@ async def on_startup(bot: Bot, settings: Settings, db: SqliteDatabase, repos: Re
     log.info("БД та репозиторії готові до роботи")
 
 
-async def on_shutdown(bot: Bot, db: SqliteDatabase) -> None:
+async def on_shutdown(bot: Bot) -> None:
     """
     Викликається при зупинці Dispatcher.
-
-    Закриваємо ресурси: БД, HTTP‑сесію бота тощо.
     """
     log.info("on_shutdown: бот зупиняється")
-    await db.close()
-    log.info("З'єднання з БД закрито")
     await bot.session.close()
     log.info("HTTP-сесія бота закрита")
 
@@ -65,7 +63,6 @@ async def on_shutdown(bot: Bot, db: SqliteDatabase) -> None:
 def register_basic_handlers(dp: Dispatcher, settings: Settings) -> None:
     """
     Базові хендлери + підключення всіх роутерів.
-    Тут же вішаємо головне меню на /start.
     """
     admin_ids = _parse_admin_ids(settings)
 
@@ -89,42 +86,35 @@ def register_basic_handlers(dp: Dispatcher, settings: Settings) -> None:
 
 
 async def main() -> None:
-    # 1. Налаштовуємо логування (консоль + файл з ротацією)
+    # 1. Налаштовуємо логування
     setup_logging(console_level="INFO", file_level="DEBUG")
     log.info("Старт програми")
 
-    # 2. Читаємо налаштування з .env
+    # 2. Читаємо налаштування
     settings = Settings()
     log.info(f"DB_ENGINE={settings.DB_ENGINE}, DB_URL={settings.DB_URL}")
 
-    # 3. Запускаємо міграції БД (поки що тільки SQLite)
+    # 3. Запускаємо міграції БД
     await run_migrations(settings)
     log.info("Міграції БД виконано")
 
-    # 4. Створюємо підключення до БД та репозиторії (SQLite)
-    if settings.DB_ENGINE.lower() != "sqlite":
-        raise RuntimeError("Наразі підтримується лише DB_ENGINE=sqlite")
-
-    db, repos = await create_sqlite_repositories(settings)
-    log.info("БД та репозиторії ініціалізовано")
-
-    # 5. Створюємо Bot і Dispatcher
+    # 4. Створюємо Bot і Dispatcher
     bot = Bot(
         token=settings.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher()
 
-    # 6. Кладемо об'єкти в контекст Dispatcher,
-    #    щоб мати до них доступ у хендлерах та подіях життєвого циклу
+    # 5. Кладемо об'єкти в контекст Dispatcher
     dp["settings"] = settings
-    dp["db"] = db
-    dp["repos"] = repos
-
-    # 7. Реєструємо /start і всі роутери користувача/адміна
+    # Замість db/repos тепер використовуємо прямі імпорти або DI через мідлварі,
+    # але оскільки ми перейшли на session.py, передавати repos не обов'язково,
+    # проте старі хендлери можуть очікувати налаштування.
+    
+    # 6. Реєструємо /start і всі роутери
     register_basic_handlers(dp, settings)
 
-    # 8. Реєструємо події життєвого циклу з DI (settings, db, repos будуть підкинуті автоматично)
+    # 7. Реєструємо події життєвого циклу
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
@@ -133,12 +123,23 @@ async def main() -> None:
         await dp.start_polling(
             bot,
             settings=settings,
-            db=db,
-            repos=repos,
+            # db=db,    <- Ці аргументи більше не потрібні, якщо ми перейшли на SQLAlchemy,
+            # repos=repos  але якщо ви використовуєте їх у старих хендлерах через DI,
+            #              то треба дивитися, чи не впаде код. 
+            #              В нашому новому коді ми використовуємо AsyncSessionLocal напряму.
+            #              Тому тут можна залишити settings, бо він використовується.
         )
+    except Exception as e:
+        log.error(f"Polling зупинено через помилку (або переривання мережі): {e}")
     finally:
-        log.info("Dispatcher зупинено")
+        log.info("Dispatcher зупинено (finally)")
+        # Додаткова гарантія закриття сесії
+        await bot.session.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        # Ловимо Ctrl+C, щоб не показувати страшний Traceback
+        print("\n🛑 Бот зупинений користувачем (Ctrl+C). Гарного дня!")

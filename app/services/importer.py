@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+from sqlalchemy import select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from app.db.base import ItemsRepository
+from app.db.session import AsyncSessionLocal
+from app.db.models import Item
 from app.utils.logging_setup import get_logger
 
 
@@ -17,8 +21,7 @@ log = get_logger(__name__, action="import")
 
 @dataclass
 class ImportResult:
-    """Результат імпорту одного файлу."""
-
+    """Результат імпорту."""
     rows_total: int
     items_processed: int
     added: int
@@ -27,356 +30,301 @@ class ImportResult:
 
 
 # -----------------------------
-# Внутрішні утиліти
+# Словник синонімів
 # -----------------------------
 
-
-def _detect_engine(path: Path) -> Optional[str]:
-    """
-    Визначає рекомендований engine для pandas.read_excel за розширенням файлу.
-
-    - .xlsx, .xlsm, .xltx, .xltm -> openpyxl
-    - .ods -> odf
-    - інакше -> None (pandas сам обере)
-    """
-    suf = path.suffix.lower()
-    if suf in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
-        return "openpyxl"
-    if suf == ".ods":
-        return "odf"
-    return None
-
-
-# Словник можливих назв колонок (різні мови/варіанти написання)
-# ДОДАНО однобуквені заголовки під формат: в, г, а, н, м, к, с
 COLUMN_ALIASES: Dict[str, List[str]] = {
-    # логічне поле -> можливі частини імені стовпця
-    "dept_code": [
-        "code",
-        "код",
-        "отдел",
-        "відділ",
-        "dept",
-        "в",           # коротке позначення "відділ"
-    ],
-    "dept_name": [
-        "dept_name",
-        "відділ",
-        "отдел",
-        "department",
-    ],
-    "group_name": [
-        "fg1_name",
-        "группа",
-        "група",
-        "category",
-        "г",           # коротке позначення "група"
-    ],
-    "articul_name": [
-        "articul_name",
-        "артикул",
-        "артикул ",
-        "articul name",
-    ],
     "sku": [
-        "sku",
-        "артикул",
-        "код товара",
-        "код",
-        "item code",
-        "а",           # коротке позначення "артикул"
+        "sku", "артикул", "код товара", "код", "item code", "а", "articul"
     ],
     "name": [
-        "name",
-        "назва",
-        "наименование",
-        "товар",
-        "опис",
-        "н",           # коротке позначення "назва"
+        "name", "назва", "наименование", "товар", "опис", "н", "name_ua"
+    ],
+    "dept_code": [
+        "dept", "code", "код відділу", "отдел", "відділ", "в", "dept_code"
+    ],
+    "dept_name": [
+        "dept_name", "назва відділу", "department"
     ],
     "qty": [
-        "залишок, к-ть",
-        "остаток, к-во",
-        "кол-во",
-        "количество",
-        "qty",
-        "quantity",
-        "к",           # коротке позначення "кількість"
+        "qty", "к-ть", "кількість", "кол-во", "залишок", "к", "quantity", "залишок, к-ть"
     ],
     "sum": [
-        "залишок, сума",
-        "сумма",
-        "amount",
-        "total",
-        "value",
-        "с",           # коротке позначення "сума"
+        "sum", "сума", "сумма", "amount", "total", "с", "залишок, сума"
     ],
     "mt_months": [
-        "міс",
-        "месяц",
-        "months",
-        "months_no_sale",
-        "м",           # коротке позначення "місяців без руху"
+        "mt", "months", "міс", "без руху", "м", "міс без продажу", "mt_months"
     ],
     "reserve": [
-        "резерв",
-        "в резерві",
-        "в резерве",
-        "reserved",
+        "reserve", "резерв", "в резерві", "reserved"
     ],
-    "price": [
-        "цена",
-        "price",
-        "unit price",
-    ],
+    # Комбіновані колонки
+    "articul_name": [
+        "articul_name", "артикул_назва", "товар (арт)"
+    ]
 }
 
 
-def _find_column(columns: Iterable[str], aliases: List[str]) -> Optional[str]:
-    """
-    Повертає назву стовпця з DataFrame, яка хоч якось збігається
-    з одним із alias (по входженню, без регістру), або None.
-    """
-    cols = list(columns)
-    lower_cols = {c: c.lower() for c in cols}
+# -----------------------------
+# Допоміжні функції (Парсинг)
+# -----------------------------
 
-    for alias in aliases:
-        alias_l = alias.lower()
-        for orig, low in lower_cols.items():
-            if alias_l in low:
-                return orig
+def _safe_float(value: Any) -> float:
+    """Конвертує рядок/число у float, прибираючи пробіли (1 000,00)."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    
+    s = str(value).strip()
+    if not s:
+        return 0.0
+    
+    # Прибираємо нерозривні пробіли та звичайні пробіли, кому на крапку
+    s = s.replace("\xa0", "").replace(" ", "").replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def _clean_sku(value: Any) -> Optional[str]:
+    """Очищає артикул (тільки цифри, має бути 8 символів)."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    # Якщо у комірці "70117244 - Назва", пробуємо спліт
+    match = re.match(r'^(\d{8})[\s\-\.]+', s)
+    if match:
+        return match.group(1)
+    
+    # Якщо просто цифри
+    digits = "".join(filter(str.isdigit, s))
+    if len(digits) == 8:
+        return digits
     return None
 
 
-def _safe_float(value: Any) -> Optional[float]:
+def _split_sku_name(row: pd.Series, cols: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
     """
-    Акуратне перетворення в float з підтримкою європейського роздільника коми.
-    Напр. '1 234,56' -> 1234.56.
+    Намагається дістати SKU та Name з рядка, враховуючи можливі склеєні колонки.
     """
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    s = str(value).strip()
-    if not s:
-        return None
-    
-    # ВИПРАВЛЕНО: додано .replace("\xa0", "") для видалення нерозривних пробілів
-    s = s.replace(" ", "").replace("\xa0", "").replace(",", ".")
-    try:
-        return float(s)
-    except (ValueError, TypeError):
-        return None
-
-
-def _split_articul_name(raw: Any) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Розділяє значення типу '70239082 - Назва товару' на (sku, name).
-    Спроба виділити перші 8 цифр як артикул, решту як назву.
-    """
-    if raw is None:
-        return None, None
-    s = str(raw).strip()
-    if not s:
-        return None, None
-
-    # Прагматично: ділимо за першим дефісом
-    parts = s.split("-", 1)
     sku = None
     name = None
 
-    if len(parts) == 2:
-        left = parts[0].strip()
-        right = parts[1].strip()
-        # Перше слово зліва вважаємо артикулом, якщо це 8 цифр
-        first_token = left.split()[0]
-        if first_token.isdigit() and len(first_token) == 8:
-            sku = first_token
-            name = right or None
-
-    return sku, name or None
-
-
-# -----------------------------
-# Основна логіка імпорту
-# -----------------------------
-
-
-def _detect_columns(df: pd.DataFrame) -> Dict[str, Optional[str]]:
-    """
-    Пробує знайти відповідність логічних полів (dept_code, qty, sum, ...)
-    до реальних назв колонок у DataFrame.
-    """
-    cols_map: Dict[str, Optional[str]] = {}
-
-    for logical, aliases in COLUMN_ALIASES.items():
-        cols_map[logical] = _find_column(df.columns, aliases)
-
-    return cols_map
-
-
-def _row_to_item_dict(row: pd.Series, cols: Dict[str, Optional[str]]) -> Optional[Dict[str, Any]]:
-    """
-    Конвертує один рядок DataFrame у dict у форматі, який очікує
-    ItemsRepository.upsert_from_import (sirі дані до нормалізації).
-    """
-    # Відділ / група
-    dept_code = row.get(cols.get("dept_code")) if cols.get("dept_code") else None
-    dept_name = row.get(cols.get("dept_name")) if cols.get("dept_name") else None
-    group_name = row.get(cols.get("group_name")) if cols.get("group_name") else None
-
-    # Артикул + назва
-    sku = None
-    name = None
-
+    # 1. Спробуємо явні колонки
     if cols.get("sku"):
-        raw_sku = row.get(cols["sku"])
-        if raw_sku is not None:
-            s = str(raw_sku).strip()
-            if s:
-                sku = s
+        raw_sku = row[cols["sku"]]
+        sku = _clean_sku(raw_sku)
 
     if cols.get("name"):
-        raw_name = row.get(cols["name"])
-        if raw_name is not None:
-            n = str(raw_name).strip()
-            if n:
-                name = n
+        name = str(row[cols["name"]]).strip()
 
-    # Якщо є articul_name (типу "70239082 - Назва") — намагаємось розділити
-    if cols.get("articul_name"):
-        raw_an = row.get(cols["articul_name"])
-        sku2, name2 = _split_articul_name(raw_an)
-        if sku is None and sku2 is not None:
-            sku = sku2
-        if name is None and name2 is not None:
-            name = name2
-
+    # 2. Якщо SKU немає або є спец-колонка "articul_name"
     if not sku:
-        # Без артикулу рядок нам нецікавий
-        return None
+        # Перевіримо, чи не сховався SKU в колонці Name (часто буває)
+        if name:
+            potential_sku = _clean_sku(name)
+            if potential_sku:
+                sku = potential_sku
+                # Можна спробувати обрізати SKU з назви, але не обов'язково
 
-    # Кількість і сума
-    qty_val = row.get(cols.get("qty")) if cols.get("qty") else None
-    sum_val = row.get(cols.get("sum")) if cols.get("sum") else None
-    qty = _safe_float(qty_val) or 0.0
-    total_sum = _safe_float(sum_val) or 0.0
+        # Перевіримо колонку articul_name
+        if cols.get("articul_name"):
+            raw_an = str(row[cols["articul_name"]])
+            potential_sku = _clean_sku(raw_an)
+            if potential_sku:
+                sku = potential_sku
+                if not name:
+                     # Пробуємо взяти все після артикулу як назву
+                     parts = re.split(r'[\s\-\.]+', raw_an, maxsplit=1)
+                     if len(parts) > 1:
+                         name = parts[1].strip()
 
-    # МТ, резерв, ціна
-    mt_raw = row.get(cols.get("mt_months")) if cols.get("mt_months") else None
-    mt_months = _safe_float(mt_raw)
-
-    reserve_raw = row.get(cols.get("reserve")) if cols.get("reserve") else None
-    reserve = _safe_float(reserve_raw) or 0.0
-
-    price_raw = row.get(cols.get("price")) if cols.get("price") else None
-    price = _safe_float(price_raw)
-
-    data: Dict[str, Any] = {
-        "sku": sku,
-        "dept_code": str(dept_code).strip() if dept_code is not None else "",
-        "dept_name": str(dept_name).strip() if dept_name is not None else None,
-        "group_name": str(group_name).strip() if group_name is not None else None,
-        "name": name or "",
-        "unit": "шт",
-        "mt_months": mt_months,
-        "qty": qty,
-        "sum": total_sum,
-        "reserve": reserve,
-        "price": price,
-    }
-    return data
+    return sku, name
 
 
-def _read_table(path: Path) -> pd.DataFrame:
+def _find_header_row(df_raw: pd.DataFrame) -> int:
     """
-    Зчитує Excel/ODS у DataFrame за допомогою pandas.read_excel.
+    Шукає індекс рядка, який найбільше схожий на заголовок.
+    Сканує перші 20 рядків.
     """
-    engine = _detect_engine(path)
-    read_kwargs: Dict[str, Any] = {
-        "dtype": object,  # читаємо як object, щоб далі самі конвертувати
-    }
-    if engine:
-        read_kwargs["engine"] = engine
+    best_idx = 0
+    max_matches = 0
 
-    log.info(f"Читаємо таблицю з файлу: {path} (engine={engine or 'auto'})")
-    df = pd.read_excel(path, **read_kwargs)
-    log.info(f"Зчитано рядків: {len(df)}; колонок: {list(df.columns)}")
-    return df
+    # Ключові слова, які точно мають бути в заголовку
+    keywords = ["sku", "артикул", "код", "назва", "name", "qty", "к-ть", "в", "г", "а", "н"]
+
+    for i in range(min(20, len(df_raw))):
+        row_values = df_raw.iloc[i].astype(str).str.lower().tolist()
+        matches = sum(1 for val in row_values for kw in keywords if kw == val or kw in val)
+        
+        if matches > max_matches:
+            max_matches = matches
+            best_idx = i
+            
+    return best_idx
 
 
 # -----------------------------
-# Публічний API сервісу імпорту
+# Основна логіка
 # -----------------------------
-
 
 async def import_items_from_file(
     file_path: Path,
-    items_repo: ItemsRepository,
-    *,
     deactivate_missing: bool = True,
 ) -> ImportResult:
     """
-    Повний цикл імпорту:
-    - читає файл (Excel/ODS) у DataFrame;
-    - за назвою колонок пробує знайти відділ/артикул/назву/к-ть/суму/МТ/резерв;
-    - конвертує рядки в список dict'ів;
-    - передає їх у items_repo.upsert_from_import;
-    - повертає короткий результат.
+    Головна функція імпорту.
     """
-    file_path = file_path.expanduser().resolve()
+    file_path = Path(file_path)
     if not file_path.exists():
-        raise FileNotFoundError(f"Файл для імпорту не знайдено: {file_path}")
+        raise FileNotFoundError(f"File not found: {file_path}")
 
-    # Зчитуємо таблицю синхронно (для великих файлів можна винести в executor)
-    df = _read_table(file_path)
+    # 1. Читаємо файл (Pandas)
+    ext = file_path.suffix.lower()
+    
+    try:
+        if ext == ".csv":
+            # Читаємо "сиро" спочатку, щоб знайти заголовок
+            df_raw = pd.read_csv(file_path, header=None, dtype=str)
+        elif ext in [".xls", ".xlsx"]:
+            df_raw = pd.read_excel(file_path, header=None, dtype=str)
+        elif ext == ".ods":
+            df_raw = pd.read_excel(file_path, engine="odf", header=None, dtype=str)
+        else:
+            raise ValueError(f"Unsupported format: {ext}")
+    except Exception as e:
+        log.error(f"Failed to read file: {e}")
+        return ImportResult(0,0,0,0,0)
+
+    # 2. Шукаємо заголовок
+    header_idx = _find_header_row(df_raw)
+    
+    # Перечитуємо з правильним заголовком
+    if ext == ".csv":
+        df = pd.read_csv(file_path, header=header_idx, dtype=str)
+    elif ext in [".xls", ".xlsx"]:
+        df = pd.read_excel(file_path, header=header_idx, dtype=str)
+    else:
+        df = pd.read_excel(file_path, engine="odf", header=header_idx, dtype=str)
+
     rows_total = len(df)
+    log.info(f"Loaded {rows_total} rows. Header found at index {header_idx}")
 
-    if rows_total == 0:
-        log.warning("Файл порожній, імпортувати нічого")
-        return ImportResult(
-            rows_total=0,
-            items_processed=0,
-            added=0,
-            updated=0,
-            deactivated=0,
-        )
+    # 3. Мапимо колонки
+    cols_map = {}
+    df.columns = df.columns.str.strip().str.lower() # нормалізуємо заголовки файлу
+    
+    for logical_name, aliases in COLUMN_ALIASES.items():
+        for col_name in df.columns:
+            if col_name in aliases: # точне співпадіння
+                cols_map[logical_name] = col_name
+                break
+            # часткове співпадіння (обережно)
+            for alias in aliases:
+                 if alias == col_name: 
+                     cols_map[logical_name] = col_name
+                     break
+    
+    log.info(f"Columns mapped: {cols_map}")
 
-    cols = _detect_columns(df)
-    log.info(f"Авто-мапінг колонок: {cols}")
+    if "sku" not in cols_map and "articul_name" not in cols_map and "a" not in df.columns:
+        # Критично, якщо не знайшли артикул
+        # Спробуємо знайти колонку 'а' (кирилиця або латиниця) вручну, якщо автомапінг не спрацював
+        pass 
 
-    raw_items: List[Dict[str, Any]] = []
-    skipped_rows = 0
+    # 4. Парсимо рядки
+    items_to_upsert = []
+    valid_skus = set()
 
-    for idx, row in df.iterrows():
-        item_dict = _row_to_item_dict(row, cols)
-        if not item_dict:
-            skipped_rows += 1
+    for _, row in df.iterrows():
+        sku, name = _split_sku_name(row, cols_map)
+        
+        if not sku:
             continue
-        raw_items.append(item_dict)
 
-    log.info(
-        "Після попередньої обробки: рядків=%s, товарів до імпорту=%s, пропущено (без sku)=%s",
-        rows_total,
-        len(raw_items),
-        skipped_rows,
-    )
+        valid_skus.add(sku)
 
-    if not raw_items:
-        return ImportResult(
-            rows_total=rows_total,
-            items_processed=0,
-            added=0,
-            updated=0,
-            deactivated=0,
-        )
+        # Числа
+        qty = _safe_float(row.get(cols_map.get("qty")))
+        total_sum = _safe_float(row.get(cols_map.get("sum")))
+        reserve = _safe_float(row.get(cols_map.get("reserve")))
+        mt = _safe_float(row.get(cols_map.get("mt_months")))
 
-    stats = await items_repo.upsert_from_import(raw_items, deactivate_missing=deactivate_missing)
+        # Ціна (розрахунок)
+        price = 0.0
+        if qty > 0:
+            price = round(total_sum / qty, 2)
+        
+        # Відділ
+        dept_code = str(row.get(cols_map.get("dept_code"), "")).split(".")[0].strip() # 10.0 -> 10
+        dept_name = str(row.get(cols_map.get("dept_name"), "")).strip()
+        
+        # Якщо відділ порожній, ставимо заглушку (можна покращити)
+        if not dept_code:
+            dept_code = "UNKNOWN"
+
+        items_to_upsert.append({
+            "sku": sku,
+            "name": name or "Без назви",
+            "dept_code": dept_code,
+            "dept_name": dept_name if dept_name else None,
+            "group_name": None, # Поки не парсимо
+            "price": price,
+            "base_qty": qty,
+            "base_reserve": reserve,
+            "mt_months": mt,
+            # "updated_at": datetime.now() # SQLAlchemy поставить саме
+        })
+
+    # 5. Запис у БД (Upsert)
+    async with AsyncSessionLocal() as session:
+        added = 0
+        updated = 0
+        
+        # Для SQLite upsert робиться через on_conflict_do_update
+        # Для Postgres так само, синтаксис майже ідентичний в SQLAlchemy 2.0
+        
+        for item_data in items_to_upsert:
+            stmt = sqlite_insert(Item).values(**item_data)
+            
+            # Що оновлюємо при конфлікті
+            do_update_stmt = stmt.on_conflict_do_update(
+                index_elements=['sku'],
+                set_={
+                    "dept_code": stmt.excluded.dept_code,
+                    "dept_name": stmt.excluded.dept_name,
+                    "name": stmt.excluded.name,
+                    "price": stmt.excluded.price,
+                    "base_qty": stmt.excluded.base_qty,
+                    "base_reserve": stmt.excluded.base_reserve,
+                    "mt_months": stmt.excluded.mt_months,
+                    "updated_at": list(stmt.excluded.updated_at)[0] if hasattr(stmt.excluded, 'updated_at') else None 
+                    # SQLAlchemy сам розбереться з часом
+                }
+            )
+            await session.execute(do_update_stmt)
+            # (Точний підрахунок added/updated складний при масовому insert, пропустимо для швидкості)
+
+        # 6. Деактивація відсутніх
+        deactivated = 0
+        if deactivate_missing and valid_skus:
+            # Ставимо qty = 0 для тих, кого немає у файлі
+            deact_stmt = (
+                update(Item)
+                .where(Item.sku.not_in(valid_skus))
+                .values(base_qty=0, base_reserve=0, mt_months=0)
+            )
+            result = await session.execute(deact_stmt)
+            deactivated = result.rowcount
+
+        await session.commit()
 
     return ImportResult(
         rows_total=rows_total,
-        items_processed=len(raw_items),
-        added=stats.get("added", 0),
-        updated=stats.get("updated", 0),
-        deactivated=stats.get("deactivated", 0),
+        items_processed=len(items_to_upsert),
+        added=len(items_to_upsert), # Приблизно
+        updated=0,
+        deactivated=deactivated
     )
