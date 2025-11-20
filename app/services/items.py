@@ -27,9 +27,17 @@ def _fmt_qty(value: Any) -> str:
 
 def format_item_card(item: Dict[str, Any]) -> str:
     """
-    Формує текст картки товару для відправки в Telegram.
+    Формує текст картки товару для відправки в Telegram (parse_mode=HTML).
 
-    Поки без динамічних залишків/лишків і кнопок – тільки статичні дані з таблиці items.
+    Структура:
+    - Назва
+    - Артикул (жирним)
+    - Розділювач
+    - Відділ / група, МТ
+    - Блок "Фото: в розробці"
+    - Ціна
+    - Стан складу (жирні кількість і резерв)
+    - Блок "Останній коментар: в розробці"
     """
 
     name = item.get("name") or "Без назви"
@@ -47,12 +55,14 @@ def format_item_card(item: Dict[str, Any]) -> str:
     base_reserve = item.get("base_reserve", 0)
     price = item.get("price")
 
-    # Заголовок
     lines: list[str] = []
-    lines.append(f"📦 <b>{name}</b>")
 
-    # Артикул
-    lines.append(f"🆔 Артикул: <code>{sku}</code>")
+    # Заголовок
+    lines.append(f"📦 {name}")
+    lines.append(f"🆔 Артикул: <b>{sku}</b>")
+    lines.append("")  # порожній рядок
+    lines.append("──────────────")
+    lines.append("")
 
     # Відділ / група
     dept_part = f"Відділ: {dept_code}"
@@ -74,23 +84,36 @@ def format_item_card(item: Dict[str, Any]) -> str:
     else:
         lines.append("⏳ Без руху: н/д")
 
+    # Блок під фото
+    lines.append("")
+    lines.append("──────────────")
+    lines.append("📷 Фото: в розробці")
+    lines.append("──────────────")
+    lines.append("")
+
     # Ціна
     if price is not None:
         try:
             price_val = float(price)
-            lines.append(f"\n💵 Ціна: {price_val:.2f} грн")
+            lines.append(f"💵 Ціна: {price_val:.2f} грн")
         except (TypeError, ValueError):
-            lines.append(f"\n💵 Ціна: {price}")
+            lines.append(f"💵 Ціна: {price}")
     else:
-        lines.append("\n💵 Ціна: н/д")
+        lines.append("💵 Ціна: н/д")
 
     # Стан складу
-    lines.append("\n📊 Стан складу:")
+    lines.append("")
+    lines.append("📊 Стан складу:")
 
     qty_str = _fmt_qty(base_qty)
     reserve_str = _fmt_qty(base_reserve)
 
-    lines.append(f"📉 Залишок (база): {qty_str}")
-    lines.append(f"🔒 Резерв (база): {reserve_str}")
+    lines.append(f"📉 Залишок (база): <b>{qty_str}</b>")
+    lines.append(f"🔒 Резерв (база): <b>{reserve_str}</b>")
+
+    # Блок під останній коментар
+    lines.append("")
+    lines.append("──────────────")
+    lines.append("💬 Останній коментар: в розробці")
 
     return "\n".join(lines)
